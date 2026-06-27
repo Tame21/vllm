@@ -1,687 +1,880 @@
-# vLLM-Ascend KV Pool 源码走读路线
+# vLLM-Ascend KV Pool 单请求端到端源码走读
 
-这份路线面向 `AscendStoreConnector` 这条 KV Pool 主线，目标是从“配置如何生效”一路走到“请求命中、KV 加载、前向计算、KV 保存、请求结束清理”的完整机制。
-
-建议按顺序阅读。每一阶段先看入口和数据结构，再看细节实现；不要一开始就钻进 Mooncake/Memcache 的底层接口，否则很容易迷路。
-
-## 0. 先建立整体模型
-
-KV Pool 不是模型里的 pooling，而是一个外部 KV cache 存储/复用机制。
-
-核心分工：
-
-- vLLM scheduler 侧决定一个请求有多少 token 可以从 KV Pool 命中，并构造本轮 worker 需要执行的 load/save 元数据。
-- worker 侧拿到元数据后，真正把 KV cache 从后端加载到本地 block，或把本地 block 保存到后端。
-- backend 侧屏蔽 Mooncake、Memcache、Yuanrong 等存储差异。
-- layerwise 模式把整段 KV 的保存/加载拆成逐层操作，用传输和 attention 计算重叠来降低阻塞。
-
-主目录：
+本文不按目录介绍 KV Pool，而是沿着一个真实用户请求追踪它的完整生命周期：
 
 ```text
-vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/
-  ascend_store_connector.py   # vLLM KVConnector 接口适配层
-  pool_scheduler.py           # scheduler 侧命中、调度、元数据构造
-  pool_worker.py              # worker 侧 KV cache 注册、load/save 执行
-  kv_transfer.py              # load/save 线程、分块传输、layerwise 批处理
-  config_data.py              # key、metadata、request tracker 等核心数据结构
-  backend/
-    backend.py                # 后端抽象接口
-    mooncake_backend.py       # Mooncake Store 后端
-    memcache_backend.py       # Memcache 后端，layerwise/GVA 重点相关
-    yuanrong_backend.py       # Yuanrong 后端
+用户发送 prompt
+  -> vLLM 接收并创建 Request
+  -> scheduler 查询本地 KV cache 和外部 KV Pool
+  -> 为请求分配本地 KV block
+  -> scheduler 构造 KV connector 元数据
+  -> worker 将外部 KV 读入本地 block
+  -> 模型只计算未命中的 token
+  -> worker 将新产生的 KV 写入外部存储
+  -> 完成状态返回 scheduler
+  -> scheduler 释放 block 并返回生成结果
 ```
 
-## 1. 从功能文档和启动参数开始
+建议先顺序读完第 1 到第 10 章，再按第 11 章的路线逐个打开源码。本文的相对路径分别以 `vllm/` 和 `vllm-ascend/` 仓库根目录为基准。
 
-先读：
+## 1. 先建立正确的运行模型
 
-- `docs/source/user_guide/feature_guide/kv_pool.md`
-- `docs/source/user_guide/feature_guide/layerwise_kv_pool.md`
+KV Pool 不是模型里的 pooling。它是位于设备本地 KV cache 之外、可跨请求或跨实例复用的 KV 存储层。
 
-重点不是部署细节，而是把这些配置项和源码变量对应起来：
+一次请求会接触两类缓存：
 
-- `kv_connector`: 通常是 `AscendStoreConnector`，旧名 `MooncakeConnectorStoreV1` 也会映射到它。
-- `kv_role`: `kv_producer`、`kv_consumer`、`kv_both`。
-- `backend`: `mooncake`、`memcache`、`yuanrong`。
-- `load_async`: 是否异步加载。
-- `consumer_is_to_put`: decode/consumer 节点是否也把 KV 写回 pool。
-- `consumer_is_to_load`: consumer 是否从 KV Pool 读。
-- `use_layerwise`: 是否启用逐层 load/save。
-- `lookup_rpc_port`: scheduler 和 worker lookup RPC 的端口。
-- `kv_load_failure_policy`: load 失败后是 `fail` 还是 `recompute`。
+| 缓存 | 所在位置 | 管理者 | 请求执行时的作用 |
+|---|---|---|---|
+| 本地 KV cache | NPU HBM 中的 block | vLLM `KVCacheManager` | attention 直接读写 |
+| 外部 KV Pool | Mooncake、Memcache、Yuanrong 等后端 | `AscendStoreConnector` | 在 forward 前后与本地 block 交换 KV |
 
-读完后你应该能回答：
+必须始终区分两条流：
 
-- 当前实例是只写、只读，还是读写都做？
-- KV Pool 是作为 PD 分离的共享前缀缓存，还是单实例/混合模式下的本地外部缓存？
-- 普通模式和 layerwise 模式的阻塞点分别在哪里？
+1. **控制流**：`request_id`、token 数、block hash、本地 block id、load/save 范围和完成状态。
+2. **数据流**：真正的 K/V tensor 字节，从外部存储复制到 NPU 地址，或从 NPU 地址复制到外部存储。
 
-## 2. 看 connector 如何注册到 vLLM
+Scheduler 只处理控制流，不搬运 KV tensor。Worker 同时拿到控制信息和本地 KV cache 地址，因此真正的数据存取只能发生在 worker。
 
-阅读：
+## 2. 全局参与者和边界
 
-- `vllm_ascend/distributed/kv_transfer/__init__.py`
-- `setup.py` 中 `ascend_kv_connector = vllm_ascend:register_connector`
-- `vllm_ascend/__init__.py`
+```mermaid
+flowchart LR
+    U["用户 / OpenAI API"] --> A["AsyncLLM"]
+    A --> E["EngineCore"]
+    E --> S["vLLM Scheduler"]
+    S --> CS["AscendStoreConnector<br/>scheduler role"]
+    CS --> PS["KVPoolScheduler"]
+    PS -. "lookup RPC / store lookup" .-> PW["KVPoolWorker"]
+    S --> X["ModelExecutor"]
+    X --> MR["Ascend ModelRunner"]
+    MR --> CW["AscendStoreConnector<br/>worker role"]
+    CW --> PW
+    PW --> T["KV transfer thread"]
+    T <--> B["KV backend"]
+    PW <--> H["NPU 本地 KV blocks"]
+    MR <--> H
+```
 
-调用关系：
+主要职责：
+
+| 组件 | 关键职责 |
+|---|---|
+| `Scheduler` | 计算本地/外部命中，分配本地 block，决定本轮计算量 |
+| `KVPoolScheduler` | 查询外部命中，维护请求 tracker，构造 `ReqMeta` |
+| `AscendStoreConnector` | 将 vLLM 标准 connector 生命周期转发给 scheduler/worker 实现 |
+| `KVPoolWorker` | 注册 KV tensor，生成 key/address/size，提交 load/save |
+| `KVTransferThread` | 后台执行 `get`、`put` 或 GVA `batch_copy` |
+| `Backend` | 屏蔽 Mooncake、Memcache、Yuanrong 的接口差异 |
+
+## 3. 服务启动时先准备了什么
+
+理解单请求前，先确认请求依赖的基础设施何时建立。
+
+### 3.1 Connector 注册和实例化
 
 ```text
-vllm-ascend package/plugin 初始化
+vllm-ascend 插件加载
   -> vllm_ascend.register_connector()
-    -> vllm_ascend.distributed.kv_transfer.register_connector()
-      -> KVConnectorFactory.register_connector("AscendStoreConnector", ...)
-```
+  -> KVConnectorFactory.register_connector("AscendStoreConnector", ...)
 
-这里确认两件事：
-
-- `AscendStoreConnector` 如何挂到上游 vLLM 的 `KVConnectorFactory`。
-- `MultiConnector` 被替换成 `AscendMultiConnector`，所以组合使用 Mooncake P2P + AscendStore KV Pool 时也要看 `ascend_multi_connector.py`。
-
-建议顺手读：
-
-- `vllm_ascend/distributed/kv_transfer/ascend_multi_connector.py`
-
-它解释了多个 connector 并存时，命中 token 和元数据如何在多个 connector 之间协调。
-
-## 3. 先读接口适配层 AscendStoreConnector
-
-阅读：
-
-- `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py`
-
-这是最好的代码入口。它把 vLLM 的标准 KV connector 生命周期拆成 scheduler 侧和 worker 侧。
-
-重点方法：
-
-```text
-Scheduler side:
-  get_num_new_matched_tokens()
-  update_state_after_alloc()
-  build_connector_meta()
-  request_finished()
-  request_finished_all_groups()
-  update_connector_output()
-  take_events()
-  bind_gpu_block_pool()
-
-Worker side:
-  register_kv_caches()
-  start_load_kv()
-  wait_for_layer_load()
-  save_kv_layer()
-  wait_for_save()
-  get_finished()
-  get_block_ids_with_load_errors()
-  build_connector_worker_meta()
-```
-
-阅读时只需要先记住：
-
-- `role == KVConnectorRole.SCHEDULER` 时创建 `KVPoolScheduler`。
-- `role == KVConnectorRole.WORKER` 时创建 `KVPoolWorker`。
-- 非 layerwise 且 rank 0 worker 会启动 `LookupKeyServer`，给 scheduler 查 KV Pool 命中。
-- `use_layerwise` 会改变 wait/save 的行为，也会要求 piecewise graph。
-
-这一层不要深挖算法，只把它当“总插座”。
-
-## 4. 接上 vLLM 上游调用点
-
-阅读上游 vLLM：
-
-- `vllm/v1/core/sched/scheduler.py`
-- `vllm/distributed/kv_transfer/kv_transfer_state.py`
-- `vllm/v1/worker/gpu/kv_connector.py`
-
-同时看 vllm-ascend 的 worker 接入：
-
-- `vllm_ascend/worker/worker.py`
-- `vllm_ascend/worker/model_runner_v1.py`
-
-关键调用链：
-
-```text
 Scheduler 初始化
-  vllm/v1/core/sched/scheduler.py
-    -> KVConnectorFactory.create_connector(... role=SCHEDULER ...)
-    -> connector.bind_gpu_block_pool(...)
+  -> KVConnectorFactory.create_connector(role=SCHEDULER)
+  -> AscendStoreConnector.connector_scheduler = KVPoolScheduler(...)
 
 Worker 初始化
-  vllm_ascend/worker/worker.py
-    -> ensure_kv_transfer_initialized(vllm_config, kv_cache_config)
-    -> KVConnectorFactory.create_connector(... role=WORKER ...)
-
-KV cache 注册
-  vllm_ascend/worker/model_runner_v1.py
-    -> get_kv_transfer_group().register_kv_caches(kv_caches)
-    -> AscendStoreConnector.register_kv_caches()
-    -> KVPoolWorker.register_kv_caches()
-
-每轮调度
-  scheduler.py
-    -> connector.get_num_new_matched_tokens()
-    -> KVCacheManager.allocate_slots(... num_external_computed_tokens ...)
-    -> connector.update_state_after_alloc()
-    -> connector.build_connector_meta()
-
-每轮 worker 前后向
-  vllm/v1/worker/gpu/kv_connector.py
-    -> pre_forward(): connector.start_load_kv(...)
-    -> post_forward(): connector.wait_for_save()
-    -> connector.get_finished()
-    -> connector.build_connector_worker_meta()
-
-worker 输出回到 scheduler
-  scheduler.py
-    -> connector.update_connector_output(kv_connector_output)
-
-请求结束
-  scheduler.py
-    -> connector.request_finished()/request_finished_all_groups()
+  -> ensure_kv_transfer_initialized(...)
+  -> KVConnectorFactory.create_connector(role=WORKER)
+  -> AscendStoreConnector.connector_worker = KVPoolWorker(...)
 ```
 
-读这一阶段时，重点看“什么时候调用”，不要急着看每个方法里面做什么。
+入口文件：
 
-## 5. 理解核心数据结构和 key 设计
+- `vllm_ascend/distributed/kv_transfer/__init__.py`
+- `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py`
+- `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py`
+- `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py`
 
-阅读：
+### 3.2 注册本地 KV cache 内存
 
-- `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/config_data.py`
+模型 KV cache 分配完成后：
 
-建议按这个顺序：
+```text
+ModelRunner / KVConnector agent
+  -> AscendStoreConnector.register_kv_caches(kv_caches)
+  -> KVPoolWorker.register_kv_caches(kv_caches)
+```
 
-1. `KeyMetadata`
-2. `PoolKey`
-3. `LayerPoolKey`
-4. `ChunkedTokenDatabase`
-5. `LoadSpec`
-6. `RequestTracker`
-7. `ReqMeta`
-8. `AscendConnectorMetadata`
-9. layerwise 相关的 `LayerTransferTask`、`LayerLoadTask`、`LayerBatchReqMeta`
-10. `AscendStoreKVConnectorWorkerMetadata`
+`KVPoolWorker.register_kv_caches()` 完成四件关键工作：
 
-最关键的是 key 的组成：
+1. 保存 `layer_name -> KV tensor` 映射。
+2. 从 tensor 取得 `data_ptr()`、每个 block 的字节长度和 stride。
+3. 调用 `ChunkedTokenDatabase.set_group_buffers()` 保存各 cache group 的基址布局。
+4. 初始化 backend、注册内存区域并启动收发线程。
+
+之后才能把一个逻辑 block id 转成真实地址：
+
+```text
+block_id
+  -> addr = group_base_addr + block_id * block_stride
+  -> size = block_len / block_size * token_count
+```
+
+对应源码：
+
+- `pool_worker.py::register_kv_caches()`
+- `config_data.py::ChunkedTokenDatabase.set_group_buffers()`
+- `config_data.py::ChunkedTokenDatabase.prepare_value()`
+- `kv_transfer.py::KVTransferThread.run()`
+
+### 3.3 普通模式的 lookup RPC
+
+普通非 layerwise 模式下，scheduler 不直接持有 worker backend。rank 0 worker 创建 `LookupKeyServer`，scheduler 侧延迟创建 `LookupKeyClient`。
+
+```text
+LookupKeyClient
+  -- ZMQ REQ: token_len + group_ids + block_hashes -->
+LookupKeyServer
+  -> KVPoolWorker.lookup_scheduler()
+  -> backend.exists(keys)
+  <-- 连续命中的 token 数 --
+```
+
+这条 RPC 只查询 key 是否存在，不传输 KV 数据。
+
+## 4. 用户请求如何进入 Scheduler
+
+以 OpenAI Chat Completion 为例，上游路径可概括为：
+
+```text
+POST /v1/chat/completions
+  -> entrypoints/openai/chat_completion/api_router.py
+     create_chat_completion()
+  -> OpenAIServingChat.create_chat_completion()
+  -> AsyncLLM.generate()
+  -> AsyncLLM.add_request()
+  -> EngineCoreClient.add_request_async()
+  -> EngineCore.add_request()
+  -> Scheduler.add_request()
+```
+
+在这条路径中，消息被模板化并 tokenize，最终形成 `Request`。对 KV Pool 最重要的字段是：
+
+| 字段 | 用途 |
+|---|---|
+| `request_id` | 串联 scheduler、worker 和后台线程状态 |
+| `prompt_token_ids` / `all_token_ids` | 确定请求长度和保存事件信息 |
+| `block_hashes` | 生成外部 KV Pool key |
+| `num_computed_tokens` | 表示本地已经可复用的 token 数 |
+
+EngineCore 的每轮执行主循环是：
+
+```text
+EngineCore.step()
+  -> scheduler.schedule()
+  -> model_executor.execute_model(scheduler_output)
+  -> scheduler.update_from_output(scheduler_output, model_output)
+```
+
+KV Pool 的绝大多数调用就嵌在这三个阶段中。
+
+## 5. 案例 A：首次请求未命中，KV 如何产生并写入
+
+先追踪一个从未出现过的 prompt。设 prompt 有 1024 tokens，KV Pool 中没有对应 key。
+
+### 5.1 Scheduler 先查本地，再查外部
+
+`Scheduler.schedule()` 先通过 `KVCacheManager` 查本地 prefix cache，然后调用：
+
+```text
+Scheduler.schedule()
+  -> connector.get_num_new_matched_tokens(request, local_hit_tokens)
+  -> AscendStoreConnector.get_num_new_matched_tokens()
+  -> KVPoolScheduler.get_num_new_matched_tokens()
+```
+
+普通模式继续走：
+
+```text
+KVPoolScheduler
+  -> LookupKeyClient.lookup(token_len, block_hashes, group_ids)
+  -> LookupKeyServer
+  -> KVPoolWorker.lookup_scheduler()
+  -> ChunkedTokenDatabase.process_tokens()
+  -> PoolKey.to_string()
+  -> backend.exists(keys)
+```
+
+首次请求的 `exists` 返回未命中，所以：
+
+```text
+local_hit_tokens = 0
+external_hit_tokens = 0
+num_computed_tokens = 0
+num_new_tokens = request.num_tokens
+```
+
+### 5.2 Key 是如何生成的
+
+`ChunkedTokenDatabase.process_tokens()` 按 cache group 的 block/chunk 粒度遍历 token 区间。每个区间使用对应 `block_hash` 生成 `PoolKey`：
 
 ```text
 model_name
-pcp_rank / dcp_rank
-head_or_tp_rank
-pp_rank
-kv_cache_group_id
-cache_role
-cache_family
-chunk_hash
-layer_id(layerwise only)
+@pcp{pcp_rank}@dcp{dcp_rank}
+@head_or_tp_rank:{rank}
+@pp_rank:{pp_rank}
+@group:{kv_cache_group_id}
+@cache_role:{kv|state}
+@cache_family:{default|c1|c4|...}
+@{chunk_hash}
 ```
 
-它决定了“什么 KV 可以复用”。读到这里要特别注意：
+Key 表示“这段 token 前缀在特定模型、并行 rank、cache group 和 cache 布局下的 KV”。因此只有 key 完全一致的数据才能复用。
 
-- `chunk_hash` 来自 vLLM block hash，用于表示 token 前缀块。
-- `kv_cache_group_id` 支持 hybrid KV cache group。
-- `cache_family` 支持压缩比例/混合 cache 布局，例如 DeepSeek V4 这类特殊模型。
-- `LayerPoolKey` 在普通 key 上额外加 `layer_id`，用于 layerwise 逐层存储。
-- `ChunkedTokenDatabase.process_tokens()` 把 token 长度和 block hash 转成可查询/可保存的 KV Pool key。
-- `prepare_value()` 和 `prepare_value_layer()` 把 block id 转成后端读写需要的内存地址和 size。
-
-这一阶段建议手动画一个表：一行是一个 block/chunk，一列是 `PoolKey.to_string()` 结果，一列是 block id，一列是本地 KV cache 地址。
-
-## 6. 深入 scheduler 侧：命中、分配后更新、构造元数据
-
-阅读：
-
-- `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py`
-
-先看 `KVPoolScheduler.__init__()`：
-
-- 读取 `kv_role`、`consumer_is_to_load`、`consumer_is_to_put`、`load_async`、`save_decode_cache`。
-- 创建 backend scheduler client。
-- 创建 `ChunkedTokenDatabase`。
-- 维护 `_request_trackers`、`_loading_req_ids`、`_preempted_req_ids` 等状态。
-
-然后按这条主线读：
+Layerwise 模式使用 `LayerPoolKey`，还会加入：
 
 ```text
-get_num_new_matched_tokens(request, num_computed_tokens)
-  -> 查询 KV Pool 中最长可命中的前缀
-  -> 返回 num_external_tokens 和是否 async load
+@layer_id:{layer_id}
+```
 
-update_state_after_alloc(request, blocks, num_external_tokens)
-  -> scheduler 已经给请求分配本地 KV block
-  -> 创建/更新 RequestTracker
-  -> 记录这个请求后续需要 load/save 哪些 block
+### 5.3 Scheduler 分配本地 block
 
-build_connector_meta(scheduler_output)
-  -> 遍历 scheduled_new_reqs / scheduled_cached_reqs
+即使要从外部加载 KV，也必须先在本地 HBM 中有落点。未命中请求则为完整 prefill 分配 block：
+
+```text
+Scheduler.schedule()
+  -> KVCacheManager.allocate_slots(...)
+  -> connector.update_state_after_alloc(
+         request,
+         kv_cache_manager.get_blocks(request_id),
+         num_external_computed_tokens,
+     )
+```
+
+`KVPoolScheduler.update_state_after_alloc()` 将请求和本地 block id 放进 `_unfinished_requests`。首次未命中没有 `LoadSpec`，所以这里只记录状态，不安排 load。
+
+### 5.4 Scheduler 构造发给 worker 的元数据
+
+调度结束前：
+
+```text
+Scheduler.schedule()
+  -> connector.build_connector_meta(scheduler_output)
+  -> KVPoolScheduler.build_connector_meta()
   -> _process_new_request()
-  -> _process_running_cached_request()
-  -> _process_preempted_cached_request()
-  -> _process_async_load_request()
-  -> 生成 AscendConnectorMetadata，交给 worker
-
-update_connector_output(connector_output)
-  -> worker 告知哪些请求 load/save 完成
-  -> 清理 loading 状态、处理 completed events
-
-request_finished()/request_finished_all_groups()
-  -> 请求结束时决定是否触发最终保存
-  -> 返回 async_save 和 kv_transfer_params
+  -> RequestTracker
+  -> ReqMeta.from_request_tracker()
+  -> AscendConnectorMetadata.requests.append(req_meta)
+  -> scheduler_output.kv_connector_metadata = metadata
 ```
 
-非 layerwise 普通命中链路中还要看：
-
-- `LookupKeyClient`
-- `get_zmq_rpc_path_lookup()`
-
-对应 worker 侧的 `LookupKeyServer`。scheduler 通过 ZMQ 问 worker：“这些 key 后端里存在多少 token？”
-
-这一阶段你要能回答：
-
-- vLLM 自己已经命中的 prefix cache 和 KV Pool 外部命中如何叠加？
-- `num_external_tokens` 是如何影响本地 block 分配和后续 forward 的？
-- 为什么 `update_state_after_alloc()` 必须在 `get_num_new_matched_tokens()` 之后？
-- preempted/cached/new request 在元数据构造时有什么差异？
-
-## 7. 深入 worker 侧：注册 KV cache、启动线程、执行 load/save
-
-阅读：
-
-- `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py`
-
-先看 `KVPoolWorker.__init__()` 和 `_init_kv_transfer_config()`：
-
-- 解析 `kv_role`、backend、parallel、layerwise、hybrid cache 等配置。
-- 创建 backend 实例。
-- 创建 `ChunkedTokenDatabase`。
-- 根据普通/layerwise、GVA/key path 选择发送和接收线程。
-
-然后看：
+此时最重要的数据变化是：
 
 ```text
-register_kv_caches(kv_caches)
-  -> 收集每层 KV cache tensor 的地址、block 大小、stride
-  -> token_database.set_group_buffers(...)
-  -> backend.register_buffer(...)
+Request
+  request_id
+  prompt_token_ids
+  block_hashes
 
-start_load_kv(metadata)
-  -> 从 AscendConnectorMetadata 中找 load_spec
-  -> 把 load 任务投递给接收线程
+        + 本地 block 分配结果
 
-wait_for_layer_load()
-  -> layerwise 模式中，在每层 attention 计算前等待该层 KV 到位
+RequestTracker
+  req_id
+  token_len
+  allocated_block_ids_by_group
+  num_saved_tokens
 
-save_kv_layer(metadata)
-  -> layerwise 模式中，每层 attention 后保存该层 KV
+        + 本轮 load/save 决策
 
-wait_for_save(metadata)
-  -> 非 layerwise 模式中，forward 后统一保存 KV
-
-get_finished(finished_req_ids, meta)
-  -> 返回 worker 已完成 sending/recving 的请求集合
-
-lookup_scheduler(...)
-  -> 给 scheduler lookup RPC 用，计算后端已有多少 token
+ReqMeta
+  req_id
+  block_hashes
+  block_ids_by_group
+  load_spec = None
+  can_save = True
+  save_start_token
+  save_end_token
 ```
 
-这一层最重要的是把“metadata 中的 token/block/key 信息”映射成“后端 get/put 的地址数组”。
+`RequestTracker` 是 scheduler 侧跨调度轮次的长期状态；`ReqMeta` 是本轮发给 worker 的快照。
 
-如果只关心普通 KV Pool，先读非 layerwise 的路径：
+### 5.5 Worker forward 前不加载
 
-- `KVCacheStoreSendingThread`
-- `KVCacheStoreRecvingThread`
-
-如果关心 layerwise，再读：
-
-- `KVCacheStoreLayerSendingThread`
-- `KVCacheStoreLayerRecvingThread`
-- `KVCacheStoreKeyLayerSendingThread`
-- `KVCacheStoreKeyLayerRecvingThread`
-
-## 8. 看 kv_transfer.py：真正的传输线程和 layerwise 批处理
-
-阅读：
-
-- `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py`
-
-建议先读基类：
-
-- `KVTransferThread`
-
-它提供：
-
-- request queue
-- finished request 记录
-- stored request 计数
-- KV event 生成
-- `_get_block_size()` 等公共工具
-
-然后分两条线：
-
-普通模式：
+`scheduler_output` 被 `ModelExecutor` 送到 worker。Ascend ModelRunner 使用上游 `KVConnectorModelRunnerMixin` 包住 forward：
 
 ```text
-KVCacheStoreSendingThread
-  -> 根据 ReqMeta 生成 keys/addrs/sizes
+ModelRunner.execute_model()
+  -> maybe_get_kv_connector_output()
+  -> _get_kv_connector_output()
+  -> connector.bind_connector_metadata(metadata)
+  -> connector.start_load_kv(forward_context)
+  -> KVPoolWorker.start_load_kv(metadata)
+```
+
+由于 `ReqMeta.load_spec is None`，worker 跳过 `get`。模型正常执行所有 prompt token，attention kernel 将每层 K/V 写入之前分配的本地 KV blocks。
+
+这里要抓住一个边界：KV Pool 不生成 KV。KV 始终由模型 forward 产生，KV Pool 只负责复制和复用。
+
+### 5.6 Forward 后将新 KV 写入 Pool
+
+退出 connector context 时：
+
+```text
+KVConnectorModelRunnerMixin._get_kv_connector_output()
+  -> connector.wait_for_save()
+  -> AscendStoreConnector.wait_for_save()
+  -> KVPoolWorker.wait_for_save(metadata)
+  -> kv_send_thread.add_request(req_meta)
+  -> KVCacheStoreSendingThread._handle_request(req_meta)
+```
+
+发送线程逐个 cache group 执行：
+
+```text
+ReqMeta.block_hashes + token range
+  -> process_tokens_with_block_ids()
+  -> keys + start/end + block ids
+
+block ids + 已注册的 KV tensor 基址
+  -> prepare_value()
+  -> addrs + sizes
+
+keys
+  -> backend.exists(keys)
+  -> 过滤已经存在的 key
+
+missing keys + addrs + sizes
   -> backend.put(keys, addrs, sizes)
+  -> 外部 KV Pool
+```
 
-KVCacheStoreRecvingThread
-  -> 根据 ReqMeta.load_spec 生成 keys/addrs/sizes
+这里的 `addr` 指向模型刚刚写完的 NPU KV block。`put` 的本质是按照 `size` 从这些地址读取字节，并以对应 key 保存到外部后端。
+
+`wait_for_save()` 最后调用 `request_queue.join()`，保证本轮 store 对后续相同 prompt 的 lookup 可见，避免后一个请求在 put 完成前查到 miss。
+
+### 5.7 保存完成状态如何返回
+
+后台发送线程完成后记录 `finished_requests`。connector context 随后收集：
+
+```text
+KVPoolWorker.get_finished()
+  -> done_sending
+KVPoolWorker.build_connector_worker_meta()
+  -> 可选 completed_events
+  -> KVConnectorOutput
+  -> ModelRunnerOutput.kv_connector_output
+  -> Scheduler.update_from_output()
+  -> connector.update_connector_output()
+```
+
+如果请求结束时发送仍未完成，`request_finished()` 可以要求 scheduler 延迟释放本地 blocks。等 `finished_sending` 返回后，再解除延迟释放。这样后端复制期间不会复用或覆盖源 block。
+
+## 6. 案例 B：相同前缀再次请求，KV 如何命中并读回
+
+现在发送一个具有相同 1024-token 前缀的新请求。假设本地 prefix cache 未命中，但外部 KV Pool 已保存前 1024 tokens。
+
+### 6.1 Lookup 只接受连续前缀
+
+`KVPoolWorker.lookup_scheduler()` 生成与保存时相同的 keys，然后调用 `backend.exists(keys)`。
+
+命中计算不是简单统计 `True` 的数量，而是找可用的连续前缀边界。若 keys 结果为：
+
+```text
+[True, True, True, False, True]
+```
+
+有效命中只能到第一个缺口之前，不能跳过中间 block 使用后面的 KV。Hybrid KV cache 时还要跨有效 cache groups 取安全的公共命中长度。
+
+若外部命中覆盖了整个请求，`get_num_new_matched_tokens()` 会减去 1 个 token：
+
+```text
+if num_external_hit_tokens == request.num_tokens:
+    num_external_hit_tokens -= 1
+```
+
+这是为了保留至少一个 token 进入模型计算，从而继续生成输出。
+
+### 6.2 Scheduler 合并本地与外部命中
+
+上游 scheduler 使用：
+
+```text
+total_computed = local_hit_tokens + external_new_hit_tokens
+num_new_tokens = request.num_tokens - total_computed
+```
+
+`KVPoolScheduler` 内部保存：
+
+```text
+LoadSpec(
+    vllm_cached_tokens=local_hit_tokens,
+    kvpool_cached_tokens=external_total_hit_tokens,
+    can_load=False,
+)
+```
+
+它返回给上游的是还需要从外部加载的增量：
+
+```text
+need_to_allocate = kvpool_cached_tokens - vllm_cached_tokens
+```
+
+例如本地命中 256、KV Pool 命中 1024，则只需为额外 768 tokens 安排外部加载，不应覆盖本地已经有效的前 256 tokens。
+
+### 6.3 先分配目标 block，再允许加载
+
+`KVCacheManager.allocate_slots()` 为外部命中和剩余计算分配本地 blocks。随后：
+
+```text
+KVPoolScheduler.update_state_after_alloc()
+  -> 取得各 cache group 的 local_block_ids
+  -> 保存到 _unfinished_requests
+  -> LoadSpec.can_load = True
+```
+
+顺序不能颠倒。Lookup 只证明外部数据存在；只有本地 block 分配成功后，worker 才知道 KV 应该写到哪里。
+
+### 6.4 LoadSpec 和 block 映射随 SchedulerOutput 下发
+
+`build_connector_meta()` 创建本轮 `ReqMeta`：
+
+```text
+ReqMeta
+  req_id
+  block_hashes
+  block_ids_by_group      # 目标本地 block
+  load_spec
+    vllm_cached_tokens    # 无需从 Pool 覆盖的前缀
+    kvpool_cached_tokens  # Pool 可提供到哪里
+    can_load = True
+  can_save
+  save_start_token / save_end_token
+```
+
+注意，元数据中没有 KV tensor 内容。它只携带“用什么 key，加载到哪些 block”的描述。
+
+### 6.5 Worker 将 key 解析为目标 NPU 地址
+
+同步普通模式的 load 主链：
+
+```text
+KVPoolWorker.start_load_kv(metadata)
+  -> 遍历 metadata.requests
+  -> 根据 LoadSpec 计算 token_len 和 mask_num
+  -> ChunkedTokenDatabase.process_tokens_with_block_ids()
+  -> ChunkedTokenDatabase.prepare_value()
+  -> backend.get(key_list, addr_list, size_list)
+```
+
+其中：
+
+```text
+mask_num = floor(vllm_cached_tokens / group_block_size) * group_block_size
+```
+
+`mask_num` 之前的 key 被跳过，因为这些 KV 已经存在于本地 HBM。
+
+每个待读取 chunk 形成三元组：
+
+```text
+key  = PoolKey(..., chunk_hash).to_string()
+addr = local_kv_base + local_block_id * block_stride
+size = bytes_per_block / tokens_per_block * tokens_in_chunk
+```
+
+`backend.get(keys, addrs, sizes)` 的数据方向是：
+
+```text
+外部 KV Pool[key] -> worker NPU addr -> 本地 KV block
+```
+
+Load 完成后，attention 看到的只是已经填充好的普通本地 KV blocks，并不需要理解外部存储。
+
+### 6.6 模型只计算未命中的 token
+
+Scheduler 已将外部命中的 token 计入 `num_computed_tokens`，因此 ModelRunner 只准备剩余 token 的 input 和 slot mapping。
+
+模型 forward 时：
+
+```text
+已加载的前缀 KV blocks
+  + 本轮未命中的 input tokens
+  -> attention
+  -> 新 token 的 K/V 继续写入后续本地 blocks
+  -> logits / sampled token
+```
+
+这就是 KV Pool 降低 TTFT 的核心：跳过命中前缀的重复 prefill 计算，但仍使用这些前缀的 K/V 参与 attention。
+
+### 6.7 新计算部分继续写回 Pool
+
+forward 后仍走第 5.6 节的 save 路径。`RequestTracker.num_saved_tokens` 和 `ReqMeta.save_start_token/save_end_token` 用于避免反复保存已经处理过的范围。
+
+`ReqMeta.from_request_tracker()` 按 `cache_transfer_granularity` 计算可保存的完整 chunk 边界，并更新 tracker。发送线程又会先 `exists`，所以已经存在的 keys 不会重复 put。
+
+至此，新请求既消费了旧 KV，也可以扩展 KV Pool 中的可复用前缀。
+
+## 7. 普通同步模式完整时序图
+
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant API as API / AsyncLLM
+    participant S as vLLM Scheduler
+    participant PS as KVPoolScheduler
+    participant LS as LookupKeyServer
+    participant W as KVPoolWorker
+    participant Store as Backend
+    participant Model as ModelRunner / Attention
+
+    User->>API: prompt
+    API->>S: Request(token_ids, block_hashes)
+    S->>S: 查询本地 prefix cache
+    S->>PS: get_num_new_matched_tokens()
+    PS->>LS: token_len + group_ids + block_hashes
+    LS->>W: lookup_scheduler()
+    W->>Store: exists(keys)
+    Store-->>W: hit vector
+    W-->>PS: 连续命中 token 数
+    PS-->>S: external tokens
+    S->>S: allocate_slots()
+    S->>PS: update_state_after_alloc(block_ids)
+    S->>PS: build_connector_meta()
+    PS-->>S: AscendConnectorMetadata
+    S->>W: SchedulerOutput + metadata
+    W->>W: key + block_id -> addr + size
+    W->>Store: get(keys, addrs, sizes)
+    Store-->>W: KV bytes 写入本地 block
+    W-->>Model: load 完成
+    Model->>Model: 仅计算未命中 tokens
+    Model-->>W: 新 KV 已写入本地 block
+    W->>Store: put(missing keys, addrs, sizes)
+    Store-->>W: save 完成
+    W-->>S: KVConnectorOutput
+    S-->>API: sampled token / request output
+    API-->>User: 流式或完整响应
+```
+
+## 8. 异步加载分支怎么变化
+
+当 `load_async=true` 且不是 layerwise 模式时，`get_num_new_matched_tokens()` 返回 `(external_tokens, True)`。
+
+第一次调度只做加载，不做模型计算：
+
+```text
+Scheduler.schedule()
+  -> num_new_tokens = 0
+  -> allocate_slots(... delay_cache_blocks=True)
+  -> request.status = WAITING_FOR_REMOTE_KVS
+  -> build_connector_meta()
+```
+
+Worker 侧变化为：
+
+```text
+KVPoolWorker.start_load_kv()
+  -> kv_recv_thread.add_request(req_meta)
+  -> KVCacheStoreRecvingThread._handle_request()
   -> backend.get(keys, addrs, sizes)
+  -> finished_requests.add(req_id)
 ```
 
-Layerwise 模式：
+本轮即使没有 forward，`kv_connector_no_forward()` 也会驱动 connector，并通过 `KVConnectorOutput.finished_recving` 把完成状态返回 scheduler。
 
 ```text
-LayerBatchBuilder
-  -> 预计算跨层共享 block 数据
-  -> 每层生成 addr/size/gva 数组
-
-KVCacheStoreLayerSendingThread / KVCacheStoreKeyLayerSendingThread
-  -> 每层保存
-
-KVCacheStoreLayerRecvingThread / KVCacheStoreKeyLayerRecvingThread
-  -> 每层加载
-
-LayerLoadTask / LayerTransferTask
-  -> 描述某层要加载/保存哪些 block range
+Scheduler.update_from_output()
+  -> finished_recving_kv_req_ids.add(req_id)
+下一轮 Scheduler.schedule()
+  -> _try_promote_blocked_waiting_request()
+  -> 请求离开 WAITING_FOR_REMOTE_KVS
+  -> 使用已加载 KV 执行剩余 token
 ```
 
-重点理解：
+异步模式因此将一次逻辑请求拆成至少两个 scheduler step：第一步搬 KV，后续一步才 forward。
 
-- 普通模式是“整段 KV 一次性 get/put”。
-- layerwise 模式是“第 i 层 KV 到位后即可算第 i 层，同时预取/保存其他层”。
-- GVA path 更偏 memcache 直接设备地址传输；key path 更偏传统 key/address/size 组织。
+## 9. Layerwise 模式怎么变化
 
-## 9. 看 backend 抽象和三个后端实现
+普通模式以一个 chunk 为单位一次搬运所有层的 KV。Layerwise 模式把 key 和传输任务增加 `layer_id` 维度，使第 N 层的 load/save 能与其他层计算重叠。
 
-先读：
-
-- `backend/backend.py`
-
-抽象接口只有几个核心方法：
+### 9.1 元数据准备
 
 ```text
-set_device()
-register_buffer(ptrs, lengths)
-exists(keys)
-batch_get_key_info(keys)
-batch_alloc(keys, sizes)
-put(keys, addrs, sizes)
-get(keys, addrs, sizes)
+KVPoolWorker.start_load_kv()
+  -> process_layer_data(metadata.requests)
+  -> 为每层生成 LayerTransferTask / LayerLoadTask
 ```
 
-然后按你实际使用的后端读：
+### 9.2 每层 attention 前加载
 
-### Mooncake
+attention 实现中的 connector hook 调用：
 
-阅读：
+```text
+进入 layer N attention
+  -> connector.wait_for_layer_load(layer_name)
+  -> KVPoolWorker.wait_for_layer_load()
+  -> 提交可执行的 layer load
+  -> 等待 layer_load_finished_events[N]
+  -> layer N attention 读取已加载 KV
+```
 
-- `backend/mooncake_backend.py`
+GVA layerwise 路径由 `KVCacheStoreLayerRecvingThread` 使用：
 
-关注：
+```text
+LayerPoolKey / GVA + local addrs + sizes
+  -> backend.store.batch_copy(direction=1)
+  -> 当前层本地 KV 地址
+```
 
-- `MooncakeStoreConfig.load_from_env()`
-- `MOONCAKE_CONFIG_PATH`
-- `global_segment_size`
-- SSD offload 配置
-- `register_buffer()`
-- `exists()`
-- `put()`
-- `get()`
+### 9.3 每层计算后保存
 
-Mooncake 是默认 backend，普通 KV Pool 走读优先看它。
+```text
+layer N attention 完成
+  -> connector.save_kv_layer(...)
+  -> KVPoolWorker.save_kv_layer()
+  -> 记录 NPU event
+  -> KVCacheStoreLayerSendingThread
+  -> event.synchronize()
+  -> backend.store.batch_copy(direction=0)
+```
 
-### Memcache
+`direction=1` 是外部/GVA 到本地地址，`direction=0` 是本地地址到外部/GVA。
 
-阅读：
-
-- `backend/memcache_backend.py`
-- `vllm_ascend/memcache_comm_fence.py`
-
-关注：
-
-- `register_buffer()`
-- `batch_get_key_info()`
-- `batch_alloc()`
-- `put()`
-- `get()`
-- layerwise/GVA 相关路径
-
-如果你要重点研究 `use_layerwise: true`，Memcache 是必须看的。
-
-### Yuanrong
-
-阅读：
-
-- `backend/yuanrong_backend.py`
-
-关注：
-
-- `YuanrongConfig`
-- `YuanrongHelper`
-- 批量切片 `_iter_slices()`
-- `put()/get()/exists()` 的错误处理和批处理逻辑
-
-## 10. 看 attention 中 layerwise hook 如何插入前向计算
-
-阅读：
+重点阅读：
 
 - `vllm_ascend/attention/utils.py`
-- `vllm_ascend/attention/sfa_v1.py`
-- `vllm_ascend/attention/mla_v1.py`
-- 可对照上游：`vllm/model_executor/layers/attention/kv_transfer_utils.py`
+- `vllm_ascend/attention/attention_v1.py` 或当前 backend 的 attention 实现
+- `pool_worker.py::process_layer_data()`
+- `pool_worker.py::wait_for_layer_load()`
+- `pool_worker.py::save_kv_layer()`
+- `kv_transfer.py::KVCacheStoreLayerRecvingThread`
+- `kv_transfer.py::KVCacheStoreLayerSendingThread`
 
-关键调用：
+## 10. 失败、抢占和请求结束
 
-```text
-attention layer before compute
-  -> connector.wait_for_layer_load(layer_name)
+### 10.1 Load 失败
 
-attention layer after KV ready / after compute
-  -> connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
-```
-
-这一阶段要把 layerwise 的时间线串起来：
+普通 `get` 返回码中非 0 的项会被 `record_failed_blocks()` 转成本地 `invalid_block_ids`：
 
 ```text
-worker.start_load_kv(metadata)
-  -> recv thread 开始预取 layer 0/1/...
-attention layer 0
-  -> wait_for_layer_load(layer0)
-  -> compute attention layer0
-  -> save_kv_layer(layer0)
-attention layer 1
-  -> wait_for_layer_load(layer1)
-  -> compute attention layer1
-  -> save_kv_layer(layer1)
-...
+backend.get() failure
+  -> KVPoolWorker._invalid_block_ids
+  -> connector.get_block_ids_with_load_errors()
+  -> KVConnectorOutput.invalid_block_ids
+  -> Scheduler.update_from_output()
 ```
 
-对比普通模式：
+上游 scheduler 根据 `kv_load_failure_policy` 决定失败请求终止还是驱逐无效 block 后 recompute。读这部分时要关注单 group 与 hybrid group 的差异。
+
+### 10.2 Preemption
+
+Scheduler 将 `preempted_req_ids` 放入 `AscendConnectorMetadata`。Worker 的发送和接收线程丢弃这些请求的完成记录，scheduler 侧也清理 tracker、loading 和 delayed-free 状态。重新调度时通过 `_process_preempted_cached_request()` 建立新的 block 映射。
+
+### 10.3 请求结束与 block 生命周期
 
 ```text
-start_load_kv()
-  -> 等整段需要加载的 KV 完成
-forward
-wait_for_save()
-  -> forward 后整段保存
+请求生成完成
+  -> Scheduler._connector_finished()
+  -> connector.request_finished() / request_finished_all_groups()
+  -> 判断是否 delay_free_blocks
 ```
 
-## 11. 关注异常和 recompute 机制
+普通异步 save 仍在读取源 block 时必须延迟释放；layerwise 已在各层同步完成，通常不再延迟。Worker 后续返回 `finished_sending` 后，scheduler 才安全释放对应 block。
+
+## 11. 按调用链走读源码
+
+不要先通读整个目录。每一步只回答给出的问题，再进入下一步。
+
+### 第 1 步：请求如何进入调度循环
 
 阅读：
 
-- `vllm_ascend/worker/model_runner_v1.py`
-- `vllm_ascend/core/recompute_scheduler.py`
-- `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py`
-- `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py`
-- 测试：`tests/ut/distributed/kv_transfer/test_kv_transfer_failures.py`
+1. `vllm/entrypoints/openai/chat_completion/api_router.py`
+2. `vllm/entrypoints/openai/chat_completion/serving.py`
+3. `vllm/v1/engine/async_llm.py::generate()`、`add_request()`
+4. `vllm/v1/engine/core.py::add_request()`、`step()`
+5. `vllm/v1/core/sched/scheduler.py::add_request()`、`schedule()`
 
-重点关键词：
+回答：`Request.block_hashes` 在进入 KV Pool 前何时生成？一次 engine step 的三个阶段是什么？
 
-- `kv_load_failure_policy`
-- `get_block_ids_with_load_errors()`
-- `invalid_block_ids`
-- `recompute`
-- `num_computed_tokens` 回退
+### 第 2 步：外部命中如何影响计算量
 
-读这部分时关注失败路径：
+阅读：
 
-```text
-backend.get() 部分失败
-  -> worker 记录 failed block ids
-  -> KVConnectorOutput.invalid_block_ids
-  -> scheduler/model runner 根据 policy fail 或 recompute
-  -> recompute 时回退 num_computed_tokens 并重新调度
-```
+1. `vllm/v1/core/sched/scheduler.py` 中 `get_num_new_matched_tokens()` 调用点
+2. `ascend_store_connector.py::get_num_new_matched_tokens()`
+3. `pool_scheduler.py::get_num_new_matched_tokens()`
 
-## 12. 读测试来验证理解
+回答：本地命中和外部命中如何相加？为什么全命中要减 1？同步和异步返回值有什么不同？
 
-优先读这些单测：
+### 第 3 步：从 block hash 追到 backend.exists
 
-- `tests/ut/distributed/ascend_store/test_config_data.py`
-- `tests/ut/distributed/ascend_store/test_backend.py`
-- `tests/ut/distributed/ascend_store/test_pool_scheduler.py`
-- `tests/ut/distributed/ascend_store/test_pool_worker.py`
-- `tests/ut/distributed/ascend_store/test_kv_transfer.py`
-- `tests/ut/distributed/ascend_store/test_ascend_store_connector.py`
-- `tests/ut/distributed/kv_transfer/test_kv_transfer_failures.py`
+阅读：
 
-读测试的顺序：
+1. `pool_scheduler.py::LookupKeyClient.lookup()`
+2. `ascend_store_connector.py::LookupKeyServer`
+3. `pool_worker.py::lookup_scheduler()`
+4. `config_data.py::ChunkedTokenDatabase.process_tokens()`
+5. `config_data.py::PoolKey.to_string()`
+6. `backend/backend.py::Backend.exists()`
 
-1. `test_config_data.py`：确认 key 和 metadata 如何生成。
-2. `test_backend.py`：确认后端接口契约。
-3. `test_pool_scheduler.py`：确认命中、tracker、metadata 构造。
-4. `test_pool_worker.py`：确认 worker 如何注册 KV cache、投递任务。
-5. `test_kv_transfer.py`：确认 transfer thread 的 get/put 行为。
-6. `test_ascend_store_connector.py`：确认 connector 对外生命周期。
-7. failure tests：确认异常和 recompute。
+回答：一个 key 包含哪些隔离维度？为什么 lookup 必须返回连续前缀而不是命中总数？
 
-测试是很好的“断言版文档”。看源码卡住时，先搜对应函数在测试里怎么构造输入。
+### 第 4 步：从命中 token 追到本地 block
 
-## 13. 一条完整请求的调用链
+阅读：
 
-### 有 KV Pool 命中的 prefill/load 路径
+1. `scheduler.py::KVCacheManager.allocate_slots()` 调用点
+2. `ascend_store_connector.py::update_state_after_alloc()`
+3. `pool_scheduler.py::update_state_after_alloc()`
+4. `config_data.py::LoadSpec`
 
-```text
-HTTP/OpenAI request
-  -> vLLM engine 创建 Request
-  -> Scheduler 调度新请求
-    -> KVCacheManager 查本地 prefix cache
-    -> AscendStoreConnector.get_num_new_matched_tokens()
-      -> KVPoolScheduler 查询外部 KV Pool 命中
-    -> KVCacheManager.allocate_slots(... num_external_computed_tokens ...)
-    -> AscendStoreConnector.update_state_after_alloc()
-      -> RequestTracker 记录 block ids / token len
-    -> AscendStoreConnector.build_connector_meta()
-      -> AscendConnectorMetadata(requests=[ReqMeta(load_spec=...)])
-  -> Worker 收到 SchedulerOutput 和 connector metadata
-    -> pre_forward/start_load_kv()
-      -> KVPoolWorker.start_load_kv()
-      -> recv thread backend.get(...)
-    -> forward
-    -> post_forward/get_finished()
-  -> Scheduler.update_connector_output()
-```
+回答：为什么 lookup 后不能立即 load？`vllm_cached_tokens` 和 `kvpool_cached_tokens` 的差值代表什么？
 
-### 保存 KV 到 pool 的路径
+### 第 5 步：从 Request 追到 ReqMeta
 
-```text
-请求被调度并完成一段 prefill/decode
-  -> build_connector_meta()
-    -> ReqMeta(can_save=True, save_start_token, save_end_token)
-  -> Worker forward
-  -> 非 layerwise: wait_for_save()
-       -> send thread backend.put(...)
-  -> layerwise: 每层 save_kv_layer()
-       -> layer send thread backend.put(...)
-  -> get_finished()
-  -> Scheduler.update_connector_output()
-  -> 请求结束时 request_finished()/request_finished_all_groups()
-```
+阅读：
 
-### lookup 路径
+1. `pool_scheduler.py::build_connector_meta()`
+2. `_process_new_request()`
+3. `_process_running_cached_request()`
+4. `_process_async_load_request()`
+5. `config_data.py::RequestTracker`
+6. `config_data.py::ReqMeta.from_request_tracker()`
+
+回答：哪些状态跨 step 保存在 scheduler，哪些字段只属于本轮 worker 指令？保存范围如何避免重复？
+
+### 第 6 步：从 SchedulerOutput 追到 worker load
+
+阅读：
+
+1. `vllm/v1/engine/core.py::step()`
+2. `vllm_ascend/worker/model_runner_v1.py::execute_model()`
+3. `vllm/v1/worker/kv_connector_model_runner_mixin.py::_get_kv_connector_output()`
+4. `ascend_store_connector.py::start_load_kv()`
+5. `pool_worker.py::start_load_kv()`
+
+回答：connector metadata 在哪里 bind？同步 `get` 位于 forward 之前还是之后？无 forward 的 step 如何驱动异步传输？
+
+### 第 7 步：从 block id 追到 KV 字节
+
+阅读：
+
+1. `pool_worker.py::register_kv_caches()`
+2. `config_data.py::set_group_buffers()`
+3. `config_data.py::prepare_value()`
+4. `backend/backend.py::get()`
+5. 当前使用的具体 backend 实现
+
+拿一个 block 手算：
 
 ```text
-Scheduler KVPoolScheduler.get_num_new_matched_tokens()
-  -> LookupKeyClient.lookup(token_len, block_hashes, group_ids)
-  -> ZMQ
-  -> Worker LookupKeyServer
-  -> KVPoolWorker.lookup_scheduler()
-  -> backend.exists(keys) 或 batch_get_key_info(keys)
-  -> 返回最长命中 token 数
+block_id -> base_addr + block_id * stride -> addr
+token range -> size
+block_hash -> PoolKey -> key string
+backend.get(key, addr, size)
 ```
 
-## 14. 推荐实际走读顺序
+回答：key、block id 和物理地址各自解决什么问题？
 
-第一轮只看骨架：
+### 第 8 步：从模型 forward 追到 backend.put
 
-1. `docs/source/user_guide/feature_guide/kv_pool.md`
-2. `vllm_ascend/distributed/kv_transfer/__init__.py`
-3. `ascend_store_connector.py`
-4. `vllm/v1/core/sched/scheduler.py` 中 connector 调用点
-5. `vllm/v1/worker/gpu/kv_connector.py`
+阅读：
 
-第二轮看数据如何流动：
+1. `KVConnectorModelRunnerMixin._get_kv_connector_output()` 的 `finally`
+2. `ascend_store_connector.py::wait_for_save()`
+3. `pool_worker.py::wait_for_save()`
+4. `kv_transfer.py::KVTransferThread.run()`
+5. `kv_transfer.py::KVCacheStoreSendingThread._handle_request()`
+6. `backend/backend.py::put()`
 
-1. `config_data.py`
-2. `pool_scheduler.py`
-3. `pool_worker.py`
-4. `kv_transfer.py`
+回答：为什么 put 前还要 exists？NPU event 和 `request_queue.join()` 分别保证什么？
 
-第三轮看存储后端：
+### 第 9 步：完成状态如何回到 scheduler
 
-1. `backend/backend.py`
-2. `backend/mooncake_backend.py`
-3. 如果开 layerwise，再看 `backend/memcache_backend.py`
-4. 如使用 Yuanrong，再看 `backend/yuanrong_backend.py`
+阅读：
 
-第四轮看与模型前向的结合：
+1. `pool_worker.py::get_finished()`
+2. `pool_worker.py::build_connector_worker_meta()`
+3. `KVConnectorModelRunnerMixin._get_kv_connector_output()` 输出构造
+4. `scheduler.py::update_from_output()`
+5. `pool_scheduler.py::update_connector_output()`
+6. `pool_scheduler.py::request_finished()`
 
-1. `vllm_ascend/attention/utils.py`
-2. `vllm_ascend/attention/sfa_v1.py`
-3. `vllm_ascend/attention/mla_v1.py`
+回答：什么时候可以释放本地 block？`finished_sending`、`finished_recving` 和 worker meta 各自携带什么？
 
-第五轮看异常、回退和测试：
+### 第 10 步：最后再读分支
 
-1. `vllm_ascend/core/recompute_scheduler.py`
-2. `tests/ut/distributed/kv_transfer/test_kv_transfer_failures.py`
-3. `tests/ut/distributed/ascend_store/*.py`
+按需要选择：
 
-## 15. 走读时建议记录的几个问题
+- 异步 load：`KVCacheStoreRecvingThread`、`WAITING_FOR_REMOTE_KVS`
+- Layerwise：`process_layer_data()`、两个 Layer transfer thread、attention hooks
+- Hybrid KV cache：`block_ids_by_group`、`kv_cache_group_ids`、cache family
+- Mamba：event id、touch/free block 和 worker completed events
+- MultiConnector：`ascend_multi_connector.py`
+- 失败恢复：`invalid_block_ids` 和 scheduler recompute 路径
 
-每读完一个阶段，建议在旁边记答案：
+## 12. 走读时维护一张请求状态表
 
-- 当前对象运行在 scheduler 进程还是 worker 进程？
-- 当前方法处理的是“查命中”、“分配后更新”、“构造元数据”、“加载”、“保存”还是“结束清理”？
-- 输入里的 token 数、block ids、block hashes 分别来自哪里？
-- 这个阶段是否区分 `kv_producer`、`kv_consumer`、`kv_both`？
-- 普通模式和 layerwise 模式在这里是否分叉？
-- 如果后端 key 不存在或 get 失败，会走 fail 还是 recompute？
-- 多 KV cache group、PP、TP、PCP、DCP 是否会改变 key 或地址计算？
+建议用一个具体 `request_id`，每经过一个断点就填写一行：
 
-## 16. 常用搜索命令
+| 阶段 | local hit | pool hit | scheduled tokens | block ids | load | save | 状态 |
+|---|---:|---:|---:|---|---|---|---|
+| 首次进入 scheduler |  |  |  |  |  |  | WAITING |
+| lookup 后 |  |  |  |  |  |  | WAITING |
+| allocate 后 |  |  |  |  |  |  | WAITING/RUNNING |
+| metadata 构造后 |  |  |  |  |  |  |  |
+| worker load 后 |  |  |  |  | done |  |  |
+| forward 后 |  |  |  |  |  | pending |  |
+| save 后 |  |  |  |  |  | done |  |
+| update_from_output 后 |  |  |  |  |  |  |  |
 
-```bash
-rg -n "AscendStoreConnector|KVPoolScheduler|KVPoolWorker|ReqMeta|RequestTracker" vllm-ascend/vllm_ascend
-rg -n "get_num_new_matched_tokens|update_state_after_alloc|build_connector_meta|request_finished" vllm vllm-ascend
-rg -n "start_load_kv|wait_for_save|save_kv_layer|wait_for_layer_load" vllm vllm-ascend
-rg -n "lookup_scheduler|LookupKeyClient|LookupKeyServer|get_zmq_rpc_path_lookup" vllm-ascend/vllm_ascend
-rg -n "batch_get_key_info|batch_alloc|register_buffer|backend.get|backend.put" vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store
-```
-
-## 17. 最小心智模型
-
-把 KV Pool 看成一张外部哈希表：
+同时记录一个 chunk 的四元组：
 
 ```text
-PoolKey(token block hash + model/parallel/cache metadata)
-  -> 外部后端中某段 KV cache 数据
+(token range, block hash/key, local block id/address, transfer size)
 ```
 
-scheduler 负责问：“这些 key 有没有？有多少连续前缀可用？”
+只要能把这个四元组从 lookup 一直追到 get/put，KV Pool 的数据流就真正串起来了。
 
-worker 负责做：“把这些 key 对应的数据搬到我的 KV cache block 地址里；或者把我的 KV cache block 地址里的数据存成这些 key。”
+## 13. 推荐断点和日志点
 
-layerwise 负责优化：“不要等所有层都搬完；每层需要时等该层，算完该层就尽快保存该层。”
+普通同步模式最小断点集合：
 
+```text
+KVPoolScheduler.get_num_new_matched_tokens
+KVPoolWorker.lookup_scheduler
+KVPoolScheduler.update_state_after_alloc
+KVPoolScheduler.build_connector_meta
+ReqMeta.from_request_tracker
+KVPoolWorker.start_load_kv
+ChunkedTokenDatabase.prepare_value
+Backend.get
+KVPoolWorker.wait_for_save
+KVCacheStoreSendingThread._handle_request
+Backend.put
+KVPoolWorker.get_finished
+Scheduler.update_from_output
+```
+
+每个断点优先观察：
+
+```text
+req_id
+token_len / num_computed_tokens
+block_hashes[:3]
+block_ids_by_group
+LoadSpec
+save_start_token / save_end_token
+keys[:3]
+addrs[:3]
+sizes[:3]
+backend return codes
+finished_sending / finished_recving
+```
+
+## 14. 最终应能复述的机制
+
+完成走读后，应能不看源码说明下面这段话：
+
+> 用户请求进入 scheduler 后，vLLM 先计算本地 prefix cache 命中，再由 `KVPoolScheduler` 把 block hashes 转成外部 keys 并查询连续命中前缀。Scheduler 将外部命中计入已计算 token，但仍先为它们分配本地 KV blocks。随后 `ReqMeta` 把 block hashes、目标 block ids 和 load/save 范围下发给 worker。Worker 根据启动时注册的 KV tensor 基址，把 block id 转成 NPU 地址，通过 backend `get` 将外部 KV 写入这些地址。模型只计算剩余 token，并把新 KV 写入后续本地 blocks。Forward 结束后，发送线程使用相同 key 规则和本地地址调用 backend `put`。传输完成状态再通过 `KVConnectorOutput` 回到 scheduler，决定请求继续调度以及本地 block 何时释放。
+
+如果这段话中的每个名词都能对应到一个类、一个方法和一组具体字段，就已经掌握了 KV Pool 的主运行机制。
