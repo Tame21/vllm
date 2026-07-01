@@ -1,8 +1,8 @@
 ### model
 model_name_or_path: Qwen/Qwen3.6-27B
 trust_remote_code: true
-use_v1_kernels: true
-flash_attn: fa2
+use_v1_kernels: false
+flash_attn: disabled
 
 ### method
 stage: sft
@@ -10,7 +10,7 @@ do_train: true
 finetuning_type: lora
 lora_rank: 8
 lora_target: all
-deepspeed: examples/deepspeed/ds_z3_config.json
+deepspeed: examples/deepspeed/ds_z3_npu_lora_config.json
 
 ### dataset
 dataset_dir: ../data/train
