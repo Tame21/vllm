@@ -1,31 +1,37 @@
 ### model
-model_name_or_path: Qwen/Qwen3.6-27B
+model_name_or_path: Qwen/Qwen1.5-MoE-A2.7B
 trust_remote_code: true
-use_v1_kernels: false
+quantization_bit: 4
+quantization_method: bnb
+double_quantization: true
 flash_attn: disabled
+use_v1_kernels: false
+moe_aux_loss_coef: 0.001
 
 ### method
 stage: sft
 do_train: true
 finetuning_type: lora
 lora_rank: 8
-lora_target: all
-deepspeed: examples/deepspeed/ds_z3_npu_lora_config.json
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target: gate_proj,up_proj,down_proj,gate,shared_expert_gate
 
 ### dataset
 dataset_dir: ../data/train
 dataset: FME_26B_traindata
-template: qwen3_6
-cutoff_len: 2048
+template: qwen
+cutoff_len: 1024
+max_samples: 128
 overwrite_cache: true
-preprocessing_num_workers: 16
-dataloader_num_workers: 4
+preprocessing_num_workers: 8
+dataloader_num_workers: 2
 packing: false
 
 ### output
-output_dir: saves/qwen3.6-27b/lora/sft_20260701_1433
-logging_steps: 10
-save_steps: 500
+output_dir: saves/qwen1.5-moe-a2.7b/qlora/moe_test_20260701_1824
+logging_steps: 1
+save_steps: 10
 plot_loss: true
 overwrite_output_dir: true
 save_only_model: false
@@ -33,17 +39,12 @@ report_to: none
 
 ### train
 per_device_train_batch_size: 1
-gradient_accumulation_steps: 4
+gradient_accumulation_steps: 8
 learning_rate: 1.0e-4
-num_train_epochs: 3.0
+max_steps: 10
 lr_scheduler_type: cosine
 warmup_ratio: 0.1
-bf16: true
+bf16: false
+fp16: true
 ddp_timeout: 180000000
 resume_from_checkpoint: null
-
-### eval
-# val_size: 0.01
-# per_device_eval_batch_size: 1
-# eval_strategy: steps
-# eval_steps: 500
